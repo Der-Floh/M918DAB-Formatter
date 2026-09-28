@@ -18,7 +18,7 @@ public static class AudioSplitterHelper
 
         var outputDirectory = Path.GetDirectoryName(inputPath);
         var ext = Path.GetExtension(inputPath);
-        var outputPattern = Path.Combine(outputDirectory, $"{Path.GetFileNameWithoutExtension(inputPath)} - Part%03d{ext}");
+        var outputPattern = await GetFilenamePattern(inputPath, segmentSeconds, outputDirectory);
 
         var mediaInfo = await FFProbe.AnalyseAsync(inputPath);
 
@@ -38,5 +38,24 @@ public static class AudioSplitterHelper
             .NotifyOnProgress(progressCallback, mediaInfo.Duration)
             .ProcessAsynchronously()
             .ConfigureAwait(false);
+    }
+
+    private static async Task<string> GetFilenamePattern(string inputPath, double segmentSeconds, string outputDirectory)
+    {
+        var mediaInfo = await FFProbe.AnalyseAsync(inputPath);
+
+        var segmentCount = (int)Math.Ceiling(
+            mediaInfo.Duration.TotalSeconds / segmentSeconds
+        );
+
+        var digits = Math.Max(2, segmentCount.ToString().Length);
+
+        var numberPattern = $"%0{digits}d";
+
+        var outputPattern = Path.Combine(
+            outputDirectory,
+            $"{numberPattern} - {Path.GetFileName(inputPath)}"
+        );
+        return outputPattern;
     }
 }

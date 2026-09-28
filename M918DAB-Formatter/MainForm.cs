@@ -8,6 +8,8 @@ public sealed partial class MainForm : Form
 {
     #region File Sorter
     private CancellationTokenSource? _sortCts;
+    private Task _sortTask = Task.CompletedTask;
+    private bool _closePending;
 
     public string? CurrSortFolderPath
     {
@@ -37,13 +39,49 @@ public sealed partial class MainForm : Form
         InitializeComponent();
     }
 
+    private bool IsBusy => !_sortTask.IsCompleted || !_splitTask.IsCompleted;
+
     private void MainForm_Load(object sender, EventArgs e)
     {
         CurrSortFolderPath = Properties.Settings.Default.LastSortFolderPath;
     }
 
-    private void MainForm_FormClosing(object sender, FormClosingEventArgs e)
+    private async void MainForm_FormClosing(object sender, FormClosingEventArgs e)
     {
+        if (!IsBusy)
+            return;
+
+        e.Cancel = true;
+        if (_closePending || (e.CloseReason == CloseReason.UserClosing && !ConfirmStopAndClose()))
+            return;
+
+        StopForClosing();
+        await Task.WhenAll(_sortTask, _splitTask);
+        // Deferred, since this still runs inside FormClosing when both tasks finished during the prompt.
+        BeginInvoke(new Action(Close));
+    }
+
+    private bool ConfirmStopAndClose() =>
+        MessageBox.Show(StopAndClosePrompt(), "Still working", MessageBoxButtons.YesNo, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2) == DialogResult.Yes;
+
+    private string StopAndClosePrompt()
+    {
+        List<string> paragraphs = [];
+        if (!_sortTask.IsCompleted)
+            paragraphs.Add("A sort is still running. Stopping it moves everything in the folder it's working on back into place, but the drive stays only partly sorted until you sort it again.");
+        if (!_splitTask.IsCompleted)
+            paragraphs.Add("A split is still running. Stopping it leaves the part being written incomplete until you split the file again.");
+
+        paragraphs.Add("Stop and close the app?");
+        return string.Join(Environment.NewLine + Environment.NewLine, paragraphs);
+    }
+
+    private void StopForClosing()
+    {
+        _closePending = true;
+        Text += " - Stopping...";
+        UseWaitCursor = true;
+        MainTabControl.Enabled = false;
         _sortCts?.Cancel();
         _splitCts?.Cancel();
     }
@@ -55,20 +93,28 @@ public sealed partial class MainForm : Form
 
     private async void StartSortButton_Click(object sender, EventArgs e)
     {
-        _sortCts = new CancellationTokenSource();
-        var token = _sortCts.Token;
+        _sortTask = RunSortAsync();
+        await _sortTask;
+    }
+
+    private async Task RunSortAsync()
+    {
+        using var cts = new CancellationTokenSource();
+        _sortCts = cts;
+        var token = cts.Token;
 
         try
         {
             var firstProgress = true;
             StartSortButton.Enabled = false;
+            SortSelectFolderButton.Enabled = false;
             SortProgressBar.Value = 0;
             SortProgressBar.Style = ProgressBarStyle.Marquee;
             SortSuccessLabel.Visible = false;
             SortProgressBar.Value = 0;
             SortProgressLabel.Text = "Preparing...";
             SortProgressLabel.Visible = true;
-            var errorCount = await Task.Run(() => SortFileHelper.SortFiles(CurrSortFolderPath, (progressPercent, errorCount) =>
+            var errorCount = await Task.Run(() => SortFileHelper.SortFiles(CurrSortFolderPath, (progressPercent, _) =>
             {
                 if (firstProgress)
                 {
@@ -97,7 +143,11 @@ public sealed partial class MainForm : Form
                     SortProgressLabel.Text = $"{Math.Round(progressPercent * 100, 2):F2}%";
                 }
             }, token), token);
-            SortSuccessLabel.Visible = true;
+
+            if (errorCount > 0)
+                MessageBox.Show($"Sorting finished, but {errorCount} entries could not be moved. The playback order may be wrong.", "Finished with errors", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            else
+                SortSuccessLabel.Visible = true;
 
             CurrSortFolderPath = CurrSortFolderPath;
         }
@@ -108,7 +158,9 @@ public sealed partial class MainForm : Form
         }
         finally
         {
+            _sortCts = null;
             SortProgressLabel.Visible = false;
+            SortSelectFolderButton.Enabled = true;
             StartSortButton.Enabled = true;
         }
     }
@@ -168,6 +220,7 @@ public sealed partial class MainForm : Form
     #region Audio Splitter
 
     private CancellationTokenSource? _splitCts;
+    private Task _splitTask = Task.CompletedTask;
 
     public string? CurrSplitterPath
     {
@@ -213,14 +266,23 @@ public sealed partial class MainForm : Form
             return;
         }
 
-        _splitCts = new CancellationTokenSource();
-        var token = _splitCts.Token;
+        _splitTask = RunSplitAsync(CurrSplitterPath!, (double)SplitTimeNumericUpDown.Value);
+        await _splitTask;
+    }
+
+    private async Task RunSplitAsync(string inputPath, double minutes)
+    {
+        using var cts = new CancellationTokenSource();
+        _splitCts = cts;
+        var token = cts.Token;
 
         try
         {
+            SplitButton.Enabled = false;
+            SplitterPathSelectButton.Enabled = false;
             SplitSuccessLabel.Visible = false;
             SplitProgressBar.Value = 0;
-            await Task.Run(() => AudioSplitterHelper.SplitAsync(CurrSplitterPath!, (double)SplitTimeNumericUpDown.Value, (progressPercent) =>
+            await Task.Run(() => AudioSplitterHelper.SplitAsync(inputPath, minutes, (progressPercent) =>
             {
                 if (InvokeRequired)
                     BeginInvoke(new Action(() => SplitProgressBar.Value = (int)Math.Round(progressPercent)));
@@ -233,6 +295,12 @@ public sealed partial class MainForm : Form
         catch (Exception ex)
         {
             MessageBox.Show($"Failed to split audio: {ex.Message}", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
+        finally
+        {
+            _splitCts = null;
+            SplitterPathSelectButton.Enabled = true;
+            SplitButton.Enabled = true;
         }
     }
 
